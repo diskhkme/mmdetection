@@ -144,6 +144,24 @@ class PackDetInputs(BaseTransform):
         repr_str = self.__class__.__name__
         repr_str += f'(meta_keys={self.meta_keys})'
         return repr_str
+    
+
+@TRANSFORMS.register_module()
+class PackDetInputsExtend(PackDetInputs):
+    def __init__(self, meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape', 'scale_factor', 'flip', 'flip_direction')) -> None:
+        super().__init__(meta_keys)
+        
+
+    def transform(self, results):
+        packed_results = super().transform(results)
+
+        if 'gt_degrees' in results:
+            packed_results['data_samples'].gt_instances.degree = \
+                results['gt_degrees']
+        if 'gt_text_strings' in results:
+            packed_results['data_samples'].gt_instances.text_string = \
+                results['gt_text_strings']
+        return packed_results
 
 
 @TRANSFORMS.register_module()

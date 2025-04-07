@@ -150,7 +150,6 @@ class LoadMultiChannelImageFromFiles(BaseTransform):
                     f'backend_args={self.backend_args})')
         return repr_str
 
-
 @TRANSFORMS.register_module()
 class LoadAnnotations(MMCV_LoadAnnotations):
     """Load and process the ``instances`` and ``seg_map`` annotation provided
@@ -459,6 +458,32 @@ class LoadAnnotations(MMCV_LoadAnnotations):
         repr_str += f"imdecode_backend='{self.imdecode_backend}', "
         repr_str += f'backend_args={self.backend_args})'
         return repr_str
+    
+
+@TRANSFORMS.register_module()
+class LoadAnnotationsExtend(LoadAnnotations):
+    """Load annotation including degree and text string."""
+    def __init__(self, 
+                 with_degree = True,
+                 with_text_string = True,
+                 *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.with_degree = with_degree
+        self.with_text_string = with_text_string
+
+    def transform(self, results: dict) -> dict:
+        results = super().transform(results)
+        if self.with_degree:
+            gt_degrees = []
+            for instance in results.get('instances', []):
+                gt_degrees.append(instance['degree'])
+            results['gt_degrees'] = np.array(gt_degrees, dtype=np.float32)
+        if self.with_text_string:
+            gt_text_strings = []
+            for instance in results.get('instances', []):
+                gt_text_strings.append(instance['text_string'])
+            results['gt_text_strings'] = np.array(gt_text_strings)
+        return results
 
 
 @TRANSFORMS.register_module()

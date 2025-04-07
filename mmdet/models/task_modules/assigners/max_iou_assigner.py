@@ -194,7 +194,8 @@ class MaxIoUAssigner(BaseAssigner):
         """
         gt_bboxes = gt_instances.bboxes
         priors = pred_instances.priors
-        gt_labels = gt_instances.labels
+        gt_labels = gt_instances.labels.
+
         if gt_instances_ignore is not None:
             gt_bboxes_ignore = gt_instances_ignore.bboxes
         else:
@@ -323,3 +324,171 @@ class MaxIoUAssigner(BaseAssigner):
             gt_inds=assigned_gt_inds,
             max_overlaps=max_overlaps,
             labels=assigned_labels)
+
+
+@TASK_UTILS.register_module()
+class MaxIoUAssignerWithDegree(MaxIoUAssigner):
+    """Assign a corresponding gt bbox or background to each bbox with degree rotation.
+    
+    This assigner extends MaxIoUAssigner to handle rotated boxes with degree information.
+    It rotates the ground truth boxes according to their degrees before calculating IoU.
+    
+    Args:
+        pos_iou_thr (float): IoU threshold for positive bboxes.
+        neg_iou_thr (float or tuple): IoU threshold for negative bboxes.
+        min_pos_iou (float): Minimum IoU for a bbox to be positive.
+        gt_max_assign_all (bool): Whether to assign all boxes with same
+            highest overlap with some gt to that gt.
+        ignore_iof_thr (float): IoF threshold for ignoring bboxes.
+        ignore_wrt_candidates (bool): Whether to compute IoF between
+            `bboxes` and `gt_bboxes_ignore`, or the contrary.
+        match_low_quality (bool): Whether to allow low quality matches.
+        gpu_assign_thr (int): Upper bound of the number of GT for GPU assign.
+        iou_calculator (dict): Config of overlaps Calculator.
+        perm_repeat_gt_cfg (dict): Config of permute repeated gt bboxes.
+    """
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+    def assign(self,
+            pred_instances: InstanceData,
+            gt_instances: InstanceData,
+            gt_instances_ignore: Optional[InstanceData] = None,
+            **kwargs) -> AssignResult:
+        """Assign gt to bboxes considering degree rotation.
+        
+        This method extends the base assign method to handle rotated boxes.
+        It rotates the ground truth boxes according to their degree information
+        before calculating IoU.
+        
+        Args:
+            pred_instances (:obj:`InstanceData`): Prediction instances with priors.
+            gt_instances (:obj:`InstanceData`): Ground truth instances with bboxes,
+                labels, and degree information.
+            gt_instances_ignore (:obj:`InstanceData`, optional): Instances
+                to be ignored during training.
+                
+        Returns:
+            :obj:`AssignResult`: The assign result.
+        """
+        gt_bboxes = gt_instances.bboxes
+        priors = pred_instances.priors
+        gt_labels = gt_instances.labels
+        gt_degrees = gt_instances.degree
+
+        if gt_instances_ignore is not None:
+            gt_bboxes_ignore = gt_instances_ignore.bboxes
+        else:
+            gt_bboxes_ignore = None
+
+        assign_on_cpu = True if (self.gpu_assign_thr > 0) and (
+            gt_bboxes.shape[0] > self.gpu_assign_thr) else False
+        # compute overlap and assign gt on CPU when number of GT is large
+        if assign_on_cpu:
+            device = priors.device
+            priors = priors.cpu()
+            gt_bboxes = gt_bboxes.cpu()
+            gt_labels = gt_labels.cpu()
+            gt_degrees = gt_degrees.cpu()
+            if gt_bboxes_ignore is not None:
+                gt_bboxes_ignore = gt_bboxes_ignore.cpu()
+
+        # 회전된 gt_bboxes의 AABB(Axis-Aligned Bounding Box) 계산
+        rotated_gt_bboxes_aabb = self._get_rotated_bboxes_aabb(gt_bboxes, gt_degrees)
+        
+        if self.perm_repeat_gt_cfg is not None and priors.numel() > 0:
+            rotated_gt_bboxes_unique = perm_repeat_bboxes(rotated_gt_bboxes_aabb,
+                                                    self.iou_calculator,
+                                                    self.perm_repeat_gt_cfg)
+        else:
+            rotated_gt_bboxes_unique = rotated_gt_bboxes_aabb
+        
+        # 원래의 iou_calculator를 사용하여 IoU 계산
+        overlaps = self.iou_calculator(rotated_gt_bboxes_unique, priors)
+
+        if (self.ignore_iof_thr > 0 and gt_bboxes_ignore is not None
+                and gt_bboxes_ignore.numel() > 0 and priors.numel() > 0):
+            if self.ignore_wrt_candidates:
+                ignore_overlaps = self.iou_calculator(
+                    priors, gt_bboxes_ignore, mode='iof')
+                ignore_max_overlaps, _ = ignore_overlaps.max(dim=1)
+            else:
+                ignore_overlaps = self.iou_calculator(
+                    gt_bboxes_ignore, priors, mode='iof')
+                ignore_max_overlaps, _ = ignore_overlaps.max(dim=0)
+            overlaps[:, ignore_max_overlaps > self.ignore_iof_thr] = -1
+
+        assign_result = self.assign_wrt_overlaps(overlaps, gt_labels)
+        if assign_on_cpu:
+            assign_result.gt_inds = assign_result.gt_inds.to(device)
+            assign_result.max_overlaps = assign_result.max_overlaps.to(device)
+            if assign_result.labels is not None:
+                assign_result.labels = assign_result.labels.to(device)
+        return assign_result
+        
+    def _get_rotated_bboxes_aabb(self, bboxes, degrees):
+        """회전된 바운딩 박스의 AABB(Axis-Aligned Bounding Box)를 계산합니다.
+        
+        Args:
+            bboxes (Tensor): 바운딩 박스 좌표, shape (n, 4), 형식은 [x1, y1, x2, y2].
+            degrees (Tensor): 회전 각도(도), shape (n,).
+            
+        Returns:
+            Tensor: 회전된 바운딩 박스의 AABB, shape (n, 4), 형식은 [x1, y1, x2, y2].
+        """
+        # 결과를 저장할 텐서 초기화
+        rotated_aabb = torch.zeros_like(bboxes)
+        
+        # numpy.float32를 torch.tensor로 변환 (필요한 경우)
+        if not isinstance(degrees, torch.Tensor):
+            degrees = torch.tensor(degrees, device=bboxes.device)
+        
+        # 각 바운딩 박스에 대해 계산
+        for i in range(bboxes.size(0)):
+            # 바운딩 박스의 좌표 추출
+            x1, y1, x2, y2 = bboxes[i]
+            
+            # 회전각(라디안)
+            angle_rad = torch.deg2rad(degrees[i].float())
+            
+            # 바운딩 박스의 중심점
+            cx = (x1 + x2) / 2
+            cy = (y1 + y2) / 2
+            
+            # 바운딩 박스의 너비와 높이
+            w = x2 - x1
+            h = y2 - y1
+            
+            # 바운딩 박스의 네 꼭지점 계산
+            corners = torch.tensor([
+                [-w/2, -h/2],  # top-left
+                [w/2, -h/2],   # top-right
+                [w/2, h/2],    # bottom-right
+                [-w/2, h/2]    # bottom-left
+            ], device=bboxes.device)
+            
+            # 회전 행렬
+            cos_angle = torch.cos(angle_rad)
+            sin_angle = torch.sin(angle_rad)
+            rot_matrix = torch.tensor([
+                [cos_angle, -sin_angle],
+                [sin_angle, cos_angle]
+            ], device=bboxes.device)
+            
+            # 각 꼭지점 회전
+            rotated_corners = torch.matmul(corners, rot_matrix.T)
+            
+            # 회전된 꼭지점들의 최소/최대값 계산
+            min_x = rotated_corners[:, 0].min()
+            min_y = rotated_corners[:, 1].min()
+            max_x = rotated_corners[:, 0].max()
+            max_y = rotated_corners[:, 1].max()
+            
+            # 중심점 기준으로 절대 좌표로 변환
+            rotated_aabb[i, 0] = cx + min_x  # x1
+            rotated_aabb[i, 1] = cy + min_y  # y1
+            rotated_aabb[i, 2] = cx + max_x  # x2
+            rotated_aabb[i, 3] = cy + max_y  # y2
+        
+        return rotated_aabb

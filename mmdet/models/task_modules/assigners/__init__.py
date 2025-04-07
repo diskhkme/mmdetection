@@ -11,7 +11,7 @@ from .iou2d_calculator import BboxOverlaps2D, BboxOverlaps2D_GLIP
 from .match_cost import (BBoxL1Cost, BinaryFocalLossCost, ClassificationCost,
                          CrossEntropyLossCost, DiceCost, FocalLossCost,
                          IoUCost)
-from .max_iou_assigner import MaxIoUAssigner
+from .max_iou_assigner import MaxIoUAssigner, MaxIoUAssignerWithDegree
 from .multi_instance_assigner import MultiInstanceAssigner
 from .point_assigner import PointAssigner
 from .region_assigner import RegionAssigner
@@ -22,9 +22,9 @@ from .uniform_assigner import UniformAssigner
 
 __all__ = [
     'BaseAssigner', 'BinaryFocalLossCost', 'MaxIoUAssigner',
-    'ApproxMaxIoUAssigner', 'AssignResult', 'PointAssigner', 'ATSSAssigner',
-    'CenterRegionAssigner', 'GridAssigner', 'HungarianAssigner',
-    'RegionAssigner', 'UniformAssigner', 'SimOTAAssigner',
+    'MaxIoUAssignerWithDegree', 'ApproxMaxIoUAssigner', 'AssignResult',
+    'PointAssigner', 'ATSSAssigner', 'CenterRegionAssigner', 'GridAssigner',
+    'HungarianAssigner', 'RegionAssigner', 'UniformAssigner', 'SimOTAAssigner',
     'TaskAlignedAssigner', 'TopkHungarianAssigner', 'BBoxL1Cost',
     'ClassificationCost', 'CrossEntropyLossCost', 'DiceCost', 'FocalLossCost',
     'IoUCost', 'BboxOverlaps2D', 'DynamicSoftLabelAssigner',
