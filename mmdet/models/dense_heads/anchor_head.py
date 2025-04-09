@@ -444,8 +444,10 @@ class AnchorHead(BaseDenseHead):
         label_weights = label_weights.reshape(-1)
         cls_score = cls_score.permute(0, 2, 3,
                                       1).reshape(-1, self.cls_out_channels)
+
         loss_cls = self.loss_cls(
             cls_score, labels, label_weights, avg_factor=avg_factor)
+
         # regression loss
         target_dim = bbox_targets.size(-1)
         bbox_targets = bbox_targets.reshape(-1, target_dim)

@@ -7,7 +7,7 @@ from mmengine.structures import InstanceData
 from torch import Tensor
 
 from mmdet.registry import TASK_UTILS
-from .assign_result import AssignResult
+from .assign_result import AssignResult, AssignResultExtend
 from .base_assigner import BaseAssigner
 
 
@@ -194,7 +194,7 @@ class MaxIoUAssigner(BaseAssigner):
         """
         gt_bboxes = gt_instances.bboxes
         priors = pred_instances.priors
-        gt_labels = gt_instances.labels.
+        gt_labels = gt_instances.labels
 
         if gt_instances_ignore is not None:
             gt_bboxes_ignore = gt_instances_ignore.bboxes
@@ -268,11 +268,13 @@ class MaxIoUAssigner(BaseAssigner):
             if num_gts == 0:
                 # No truth, assign everything to background
                 assigned_gt_inds[:] = 0
-            return AssignResult(
+
+            assign_result = AssignResult(
                 num_gts=num_gts,
                 gt_inds=assigned_gt_inds,
                 max_overlaps=max_overlaps,
                 labels=assigned_labels)
+            return assign_result
 
         # for each anchor, which gt best overlaps with it
         # for each anchor, the max iou of all gts
@@ -319,11 +321,13 @@ class MaxIoUAssigner(BaseAssigner):
             assigned_labels[pos_inds] = gt_labels[assigned_gt_inds[pos_inds] -
                                                   1]
 
-        return AssignResult(
+        assign_result = AssignResult(
             num_gts=num_gts,
             gt_inds=assigned_gt_inds,
             max_overlaps=max_overlaps,
             labels=assigned_labels)
+
+        return assign_result
 
 
 @TASK_UTILS.register_module()
@@ -348,14 +352,116 @@ class MaxIoUAssignerWithDegree(MaxIoUAssigner):
         perm_repeat_gt_cfg (dict): Config of permute repeated gt bboxes.
     """
     
-    def __init__(self, *args, **kwargs):
+    def __init__(self, angle_bins, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.angle_bins = angle_bins
+
+    def assign_wrt_overlaps(self, overlaps: Tensor,
+                            gt_labels: Tensor,
+                            gt_degree_labels: Tensor) -> AssignResultExtend:
+        """Assign w.r.t. the overlaps of priors with gts.
+
+        Args:
+            overlaps (Tensor): Overlaps between k gt_bboxes and n bboxes,
+                shape(k, n).
+            gt_labels (Tensor): Labels of k gt_bboxes, shape (k, ).
+
+        Returns:
+            :obj:`AssignResult`: The assign result.
+        """
+        num_gts, num_bboxes = overlaps.size(0), overlaps.size(1)
+
+        # 1. assign -1 by default
+        assigned_gt_inds = overlaps.new_full((num_bboxes, ),
+                                             -1,
+                                             dtype=torch.long)
+
+        if num_gts == 0 or num_bboxes == 0:
+            # No ground truth or boxes, return empty assignment
+            max_overlaps = overlaps.new_zeros((num_bboxes, ))
+            assigned_labels = overlaps.new_full((num_bboxes, ),
+                                                -1,
+                                                dtype=torch.long)
+            assigned_degree_labels = overlaps.new_full((num_bboxes,),
+                                                -1,
+                                                dtype=torch.long)
+
+            if num_gts == 0:
+                # No truth, assign everything to background
+                assigned_gt_inds[:] = 0
+
+            assign_result = AssignResultExtend(
+                num_gts=num_gts,
+                gt_inds=assigned_gt_inds,
+                max_overlaps=max_overlaps,
+                labels=assigned_labels,
+                degree_labels = assigned_degree_labels)
+
+            return assign_result
+
+        # for each anchor, which gt best overlaps with it
+        # for each anchor, the max iou of all gts
+        max_overlaps, argmax_overlaps = overlaps.max(dim=0)
+        # for each gt, which anchor best overlaps with it
+        # for each gt, the max iou of all proposals
+        gt_max_overlaps, gt_argmax_overlaps = overlaps.max(dim=1)
+
+        # 2. assign negative: below
+        # the negative inds are set to be 0
+        if isinstance(self.neg_iou_thr, float):
+            assigned_gt_inds[(max_overlaps >= 0)
+                             & (max_overlaps < self.neg_iou_thr)] = 0
+        elif isinstance(self.neg_iou_thr, tuple):
+            assert len(self.neg_iou_thr) == 2
+            assigned_gt_inds[(max_overlaps >= self.neg_iou_thr[0])
+                             & (max_overlaps < self.neg_iou_thr[1])] = 0
+
+        # 3. assign positive: above positive IoU threshold
+        pos_inds = max_overlaps >= self.pos_iou_thr
+        assigned_gt_inds[pos_inds] = argmax_overlaps[pos_inds] + 1
+
+        if self.match_low_quality:
+            # Low-quality matching will overwrite the assigned_gt_inds assigned
+            # in Step 3. Thus, the assigned gt might not be the best one for
+            # prediction.
+            # For example, if bbox A has 0.9 and 0.8 iou with GT bbox 1 & 2,
+            # bbox 1 will be assigned as the best target for bbox A in step 3.
+            # However, if GT bbox 2's gt_argmax_overlaps = A, bbox A's
+            # assigned_gt_inds will be overwritten to be bbox 2.
+            # This might be the reason that it is not used in ROI Heads.
+            for i in range(num_gts):
+                if gt_max_overlaps[i] >= self.min_pos_iou:
+                    if self.gt_max_assign_all:
+                        max_iou_inds = overlaps[i, :] == gt_max_overlaps[i]
+                        assigned_gt_inds[max_iou_inds] = i + 1
+                    else:
+                        assigned_gt_inds[gt_argmax_overlaps[i]] = i + 1
+
+        assigned_labels = assigned_gt_inds.new_full((num_bboxes, ), -1)
+        assigned_degree_labels = assigned_gt_inds.new_full((num_bboxes,), -1)
+        pos_inds = torch.nonzero(
+            assigned_gt_inds > 0, as_tuple=False).squeeze()
+        if pos_inds.numel() > 0:
+            assigned_labels[pos_inds] = gt_labels[assigned_gt_inds[pos_inds] -
+                                                  1]
+            assigned_degree_labels[pos_inds] = gt_degree_labels[assigned_gt_inds[pos_inds] -
+                                                  1]
+
+        assign_result = AssignResultExtend(
+            num_gts=num_gts,
+            gt_inds=assigned_gt_inds,
+            max_overlaps=max_overlaps,
+            labels=assigned_labels,
+            degree_labels=assigned_degree_labels)
+        
+
+        return assign_result
         
     def assign(self,
             pred_instances: InstanceData,
             gt_instances: InstanceData,
             gt_instances_ignore: Optional[InstanceData] = None,
-            **kwargs) -> AssignResult:
+            **kwargs) -> AssignResultExtend:
         """Assign gt to bboxes considering degree rotation.
         
         This method extends the base assign method to handle rotated boxes.
@@ -375,7 +481,7 @@ class MaxIoUAssignerWithDegree(MaxIoUAssigner):
         gt_bboxes = gt_instances.bboxes
         priors = pred_instances.priors
         gt_labels = gt_instances.labels
-        gt_degrees = gt_instances.degree
+        gt_degree_labels = gt_instances.degree_labels
 
         if gt_instances_ignore is not None:
             gt_bboxes_ignore = gt_instances_ignore.bboxes
@@ -390,12 +496,12 @@ class MaxIoUAssignerWithDegree(MaxIoUAssigner):
             priors = priors.cpu()
             gt_bboxes = gt_bboxes.cpu()
             gt_labels = gt_labels.cpu()
-            gt_degrees = gt_degrees.cpu()
+            gt_degree_labels = gt_degree_labels.cpu()
             if gt_bboxes_ignore is not None:
                 gt_bboxes_ignore = gt_bboxes_ignore.cpu()
 
         # 회전된 gt_bboxes의 AABB(Axis-Aligned Bounding Box) 계산
-        rotated_gt_bboxes_aabb = self._get_rotated_bboxes_aabb(gt_bboxes, gt_degrees)
+        rotated_gt_bboxes_aabb = self._get_rotated_bboxes_aabb(gt_bboxes, gt_degree_labels)
         
         if self.perm_repeat_gt_cfg is not None and priors.numel() > 0:
             rotated_gt_bboxes_unique = perm_repeat_bboxes(rotated_gt_bboxes_aabb,
@@ -419,26 +525,37 @@ class MaxIoUAssignerWithDegree(MaxIoUAssigner):
                 ignore_max_overlaps, _ = ignore_overlaps.max(dim=0)
             overlaps[:, ignore_max_overlaps > self.ignore_iof_thr] = -1
 
-        assign_result = self.assign_wrt_overlaps(overlaps, gt_labels)
+        assign_result = self.assign_wrt_overlaps(overlaps, gt_labels, gt_degree_labels)
         if assign_on_cpu:
             assign_result.gt_inds = assign_result.gt_inds.to(device)
             assign_result.max_overlaps = assign_result.max_overlaps.to(device)
             if assign_result.labels is not None:
                 assign_result.labels = assign_result.labels.to(device)
+            if assign_result.degree_labels is not None:
+                assign_result.degree_labels = assign_result.degree_labels.to(device)
+
         return assign_result
         
-    def _get_rotated_bboxes_aabb(self, bboxes, degrees):
+    def _get_rotated_bboxes_aabb(self, bboxes, degree_labels):
         """회전된 바운딩 박스의 AABB(Axis-Aligned Bounding Box)를 계산합니다.
         
         Args:
             bboxes (Tensor): 바운딩 박스 좌표, shape (n, 4), 형식은 [x1, y1, x2, y2].
-            degrees (Tensor): 회전 각도(도), shape (n,).
+            degree_labels (Tensor or np.ndarray): 회전 각도의 label, shape (n,).
             
         Returns:
             Tensor: 회전된 바운딩 박스의 AABB, shape (n, 4), 형식은 [x1, y1, x2, y2].
         """
         # 결과를 저장할 텐서 초기화
         rotated_aabb = torch.zeros_like(bboxes)
+        
+        # degree_labels로부터 degrees 계산
+        if isinstance(degree_labels, torch.Tensor):
+            degrees = degree_labels.float() * (360.0 / self.angle_bins)
+        else:
+            # NumPy 배열인 경우
+            import numpy as np
+            degrees = torch.from_numpy(degree_labels.astype(np.float32)).to(bboxes.device) * (360.0 / self.angle_bins)
         
         # numpy.float32를 torch.tensor로 변환 (필요한 경우)
         if not isinstance(degrees, torch.Tensor):

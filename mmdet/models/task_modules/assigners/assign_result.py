@@ -196,3 +196,68 @@ class AssignResult(util_mixins.NiceRepr):
             [self.max_overlaps.new_ones(len(gt_labels)), self.max_overlaps])
 
         self.labels = torch.cat([gt_labels, self.labels])
+
+
+class AssignResultExtend(AssignResult):
+    """Stores assignments between predicted and truth boxes with angle information.
+
+    Attributes:
+        num_gts (int): the number of truth boxes considered when computing this
+            assignment
+        gt_inds (Tensor): for each predicted box indicates the 1-based
+            index of the assigned truth box. 0 means unassigned and -1 means
+            ignore.
+        max_overlaps (Tensor): the iou between the predicted box and its
+            assigned truth box.
+        labels (Tensor): If specified, for each predicted box
+            indicates the category label of the assigned truth box.
+        degree_labels (Tensor): If specified, for each predicted box
+            indicates the degree label of the assigned truth box.
+    """
+
+    def __init__(self, num_gts: int, gt_inds: Tensor, max_overlaps: Tensor,
+                 labels: Tensor, degree_labels: Tensor = None) -> None:
+        super().__init__(num_gts, gt_inds, max_overlaps, labels)
+        self.degree_labels = degree_labels
+
+    @property
+    def info(self):
+        """dict: a dictionary of info about the object"""
+        basic_info = super().info
+        if self.degree_labels is not None:
+            basic_info['degree_labels'] = self.degree_labels
+        return basic_info
+
+    def __nice__(self):
+        """str: a "nice" summary string describing this assign result"""
+        parts = []
+        parts.append(f'num_gts={self.num_gts!r}')
+        if self.gt_inds is None:
+            parts.append(f'gt_inds={self.gt_inds!r}')
+        else:
+            parts.append(f'gt_inds.shape={tuple(self.gt_inds.shape)!r}')
+        if self.max_overlaps is None:
+            parts.append(f'max_overlaps={self.max_overlaps!r}')
+        else:
+            parts.append('max_overlaps.shape='
+                         f'{tuple(self.max_overlaps.shape)!r}')
+        if self.labels is None:
+            parts.append(f'labels={self.labels!r}')
+        else:
+            parts.append(f'labels.shape={tuple(self.labels.shape)!r}')
+        if self.degree_labels is not None:
+            parts.append(f'degree_labels.shape={tuple(self.degree_labels.shape)!r}')
+        return ', '.join(parts)
+
+    def add_gt_(self, gt_labels, gt_degree_labels=None):
+        """Add ground truth as assigned results.
+
+        Args:
+            gt_labels (torch.Tensor): Labels of gt boxes
+            gt_degree_labels (torch.Tensor, optional): Degree labels of gt boxes
+        """
+        super().add_gt_(gt_labels)
+        if gt_degree_labels is not None and self.degree_labels is not None:
+            self.degree_labels = torch.cat([gt_degree_labels, self.degree_labels])
+
+

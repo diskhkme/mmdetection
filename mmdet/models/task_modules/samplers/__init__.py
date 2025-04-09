@@ -8,15 +8,16 @@ from .mask_sampling_result import MaskSamplingResult
 from .multi_instance_random_sampler import MultiInsRandomSampler
 from .multi_instance_sampling_result import MultiInstanceSamplingResult
 from .ohem_sampler import OHEMSampler
-from .pseudo_sampler import PseudoSampler
+from .pseudo_sampler import PseudoSampler, PseudoSamplerExtend
 from .random_sampler import RandomSampler
 from .sampling_result import SamplingResult
+from .sampling_result_extend import SamplingResultExtend
 from .score_hlr_sampler import ScoreHLRSampler
 
 __all__ = [
-    'BaseSampler', 'PseudoSampler', 'RandomSampler',
+    'BaseSampler', 'PseudoSampler', 'PseudoSamplerExtend', 'RandomSampler',
     'InstanceBalancedPosSampler', 'IoUBalancedNegSampler', 'CombinedSampler',
-    'OHEMSampler', 'SamplingResult', 'ScoreHLRSampler', 'MaskPseudoSampler',
+    'OHEMSampler', 'SamplingResult', 'SamplingResultExtend', 'ScoreHLRSampler', 'MaskPseudoSampler',
     'MaskSamplingResult', 'MultiInstanceSamplingResult',
     'MultiInsRandomSampler'
 ]

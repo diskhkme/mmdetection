@@ -1,6 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from .approx_max_iou_assigner import ApproxMaxIoUAssigner
-from .assign_result import AssignResult
+from .assign_result import AssignResult, AssignResultExtend
 from .atss_assigner import ATSSAssigner
 from .base_assigner import BaseAssigner
 from .center_region_assigner import CenterRegionAssigner
@@ -22,7 +22,7 @@ from .uniform_assigner import UniformAssigner
 
 __all__ = [
     'BaseAssigner', 'BinaryFocalLossCost', 'MaxIoUAssigner',
-    'MaxIoUAssignerWithDegree', 'ApproxMaxIoUAssigner', 'AssignResult',
+    'MaxIoUAssignerWithDegree', 'ApproxMaxIoUAssigner', 'AssignResult', 'AssignResultExtend',
     'PointAssigner', 'ATSSAssigner', 'CenterRegionAssigner', 'GridAssigner',
     'HungarianAssigner', 'RegionAssigner', 'UniformAssigner', 'SimOTAAssigner',
     'TaskAlignedAssigner', 'TopkHungarianAssigner', 'BBoxL1Cost',

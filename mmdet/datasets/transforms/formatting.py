@@ -156,11 +156,12 @@ class PackDetInputsExtend(PackDetInputs):
         packed_results = super().transform(results)
 
         if 'gt_degrees' in results:
-            packed_results['data_samples'].gt_instances.degree = \
-                results['gt_degrees']
+            packed_results['data_samples'].gt_instances.degree = to_tensor(results['gt_degrees'])
+        if 'gt_degree_labels' in results:
+            packed_results['data_samples'].gt_instances.degree_labels = to_tensor(results['gt_degree_labels'])
         if 'gt_text_strings' in results:
-            packed_results['data_samples'].gt_instances.text_string = \
-                results['gt_text_strings']
+            packed_results['data_samples'].gt_instances.text_string = results['gt_text_strings']
+
         return packed_results
 
 

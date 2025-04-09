@@ -179,7 +179,7 @@ class LoadAnnotations(MMCV_LoadAnnotations):
                 # coordinates in unit of pixels.
                 # 2. If dict, it represents the per-pixel segmentation mask in
                 # COCO's compressed RLE format. The dict should have keys
-                # “size” and “counts”.  Can be loaded by pycocotools
+                # "size" and "counts".  Can be loaded by pycocotools
                 'mask': list[list[float]] or dict,
 
                 }
@@ -465,19 +465,27 @@ class LoadAnnotationsExtend(LoadAnnotations):
     """Load annotation including degree and text string."""
     def __init__(self, 
                  with_degree = True,
+                 angle_bins = 24,
                  with_text_string = True,
                  *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.with_degree = with_degree
+        self.angle_bins = angle_bins
         self.with_text_string = with_text_string
 
     def transform(self, results: dict) -> dict:
         results = super().transform(results)
         if self.with_degree:
             gt_degrees = []
+            gt_degree_labels = []
             for instance in results.get('instances', []):
-                gt_degrees.append(instance['degree'])
+                degree = instance['degree']
+                gt_degrees.append(degree)
+                # Convert degree to label (0 to angle_bins-1)
+                degree_label = int((degree % 360) / (360 / self.angle_bins))
+                gt_degree_labels.append(degree_label)
             results['gt_degrees'] = np.array(gt_degrees, dtype=np.float32)
+            results['gt_degree_labels'] = np.array(gt_degree_labels, dtype=np.int64)
         if self.with_text_string:
             gt_text_strings = []
             for instance in results.get('instances', []):
@@ -979,7 +987,7 @@ class LoadTrackAnnotations(LoadAnnotations):
                 # coordinates in unit of pixels.
                 # 2. If dict, it represents the per-pixel segmentation mask in
                 # COCO's compressed RLE format. The dict should have keys
-                # “size” and “counts”.  Can be loaded by pycocotools
+                # "size" and "counts".  Can be loaded by pycocotools
                 'mask': list[list[float]] or dict,
                 }
             ]
