@@ -1,10 +1,11 @@
 import warnings
 from typing import List, Optional, Tuple, Union
-
+import copy
 import torch
 import torch.nn as nn
 from mmengine.structures import InstanceData
 from torch import Tensor
+import numpy as np
 
 from mmdet.registry import MODELS, TASK_UTILS
 from mmdet.structures.bbox import BaseBoxes, cat_boxes, get_box_tensor
@@ -17,6 +18,13 @@ from ..utils import images_to_levels, multi_apply, unmap
 from .base_dense_head import BaseDenseHead
 from .retina_head import RetinaHead
 from mmcv.cnn import ConvModule
+from mmengine.config import ConfigDict
+from ..utils import (filter_scores_and_topk, select_single_mlvl,
+                     unpack_gt_instances)
+from mmdet.structures import SampleList
+from mmdet.structures.bbox import (cat_boxes, get_box_tensor, get_box_wh,
+                                   scale_boxes)
+from mmcv.ops import batched_nms
 
 
 
@@ -451,3 +459,297 @@ class RetinaHeadWithDegree(RetinaHead):
             degree_labels_pred, degree_labels_targets, degree_label_weights, avg_factor=avg_factor)
         
         return loss_degree_labels
+    
+    def predict(self,
+                x: Tuple[Tensor],
+                batch_data_samples: SampleList,
+                rescale: bool = False) -> InstanceList:
+
+        batch_img_metas = [
+            data_samples.metainfo for data_samples in batch_data_samples
+        ]
+
+        outs = self(x)
+
+        predictions = self.predict_by_feat_with_degree(
+            *outs, batch_img_metas=batch_img_metas, rescale=rescale)
+        return predictions
+    
+    # -- override predict_by_feat of base_dense_head
+    def predict_by_feat_with_degree(self,
+                        cls_scores: List[Tensor],
+                        bbox_preds: List[Tensor],
+                        degree_labels_scores: List[Tensor],
+                        score_factors: Optional[List[Tensor]] = None,
+                        batch_img_metas: Optional[List[dict]] = None,
+                        cfg: Optional[ConfigDict] = None,
+                        rescale: bool = False,
+                        with_nms: bool = True) -> InstanceList:
+
+        assert len(cls_scores) == len(bbox_preds)
+
+        if score_factors is None:
+            # e.g. Retina, FreeAnchor, Foveabox, etc.
+            with_score_factors = False
+        else:
+            # e.g. FCOS, PAA, ATSS, AutoAssign, etc.
+            with_score_factors = True
+            assert len(cls_scores) == len(score_factors)
+
+        num_levels = len(cls_scores)
+
+        featmap_sizes = [cls_scores[i].shape[-2:] for i in range(num_levels)]
+        mlvl_priors = self.prior_generator.grid_priors(
+            featmap_sizes,
+            dtype=cls_scores[0].dtype,
+            device=cls_scores[0].device)
+
+        result_list = []
+
+        for img_id in range(len(batch_img_metas)):
+            img_meta = batch_img_metas[img_id]
+            cls_score_list = select_single_mlvl(
+                cls_scores, img_id, detach=True)
+            bbox_pred_list = select_single_mlvl(
+                bbox_preds, img_id, detach=True)
+            degree_labels_score_list = select_single_mlvl(degree_labels_scores, img_id, detach=True)
+            if with_score_factors:
+                score_factor_list = select_single_mlvl(
+                    score_factors, img_id, detach=True)
+            else:
+                score_factor_list = [None for _ in range(num_levels)]
+
+            results = self._predict_by_feat_single_with_degree(
+                cls_score_list=cls_score_list,
+                bbox_pred_list=bbox_pred_list,
+                degree_labels_score_list=degree_labels_score_list,
+                score_factor_list=score_factor_list,
+                mlvl_priors=mlvl_priors,
+                img_meta=img_meta,
+                cfg=cfg,
+                rescale=rescale,
+                with_nms=with_nms)
+            result_list.append(results)
+        return result_list
+
+    # -- override _predict_by_feat_single of base_dense_head
+    def _predict_by_feat_single_with_degree(self,
+                                cls_score_list: List[Tensor],
+                                bbox_pred_list: List[Tensor],
+                                degree_labels_score_list: List[Tensor],
+                                score_factor_list: List[Tensor],
+                                mlvl_priors: List[Tensor],
+                                img_meta: dict,
+                                cfg: ConfigDict,
+                                rescale: bool = False,
+                                with_nms: bool = True) -> InstanceData:
+
+        if score_factor_list[0] is None:
+            # e.g. Retina, FreeAnchor, etc.
+            with_score_factors = False
+        else:
+            # e.g. FCOS, PAA, ATSS, etc.
+            with_score_factors = True
+
+        cfg = self.test_cfg if cfg is None else cfg
+        cfg = copy.deepcopy(cfg)
+        img_shape = img_meta['img_shape']
+        nms_pre = cfg.get('nms_pre', -1)
+
+        mlvl_bbox_preds = []
+        mlvl_valid_priors = []
+        mlvl_scores = []
+        mlvl_labels = []
+        mlvl_degree_scores = []
+        mlvl_degree_labels = []
+
+        if with_score_factors:
+            mlvl_score_factors = []
+        else:
+            mlvl_score_factors = None
+        for level_idx, (cls_score, bbox_pred, degree_score, score_factor, priors) in \
+                enumerate(zip(cls_score_list, bbox_pred_list, degree_labels_score_list,
+                              score_factor_list, mlvl_priors)):
+
+            assert cls_score.size()[-2:] == bbox_pred.size()[-2:]
+
+            dim = self.bbox_coder.encode_size
+            bbox_pred = bbox_pred.permute(1, 2, 0).reshape(-1, dim)
+            if with_score_factors:
+                score_factor = score_factor.permute(1, 2,
+                                                    0).reshape(-1).sigmoid()
+            cls_score = cls_score.permute(1, 2,
+                                          0).reshape(-1, self.cls_out_channels)
+            degree_score = degree_score.permute(1, 2,
+                                                    0).reshape(-1, self.degree_labels_out_channels)
+
+
+            # the `custom_cls_channels` parameter is derived from
+            # CrossEntropyCustomLoss and FocalCustomLoss, and is currently used
+            # in v3det.
+            # TODO: (KHK) sigmoid에 따르는 처리를 degree label에도 적용함. 문제 없는지 확인 필요
+            if getattr(self.loss_cls, 'custom_cls_channels', False):
+                scores = self.loss_cls.get_activation(cls_score)
+            elif self.use_sigmoid_cls:
+                scores = cls_score.sigmoid()
+                degree_score = degree_score.sigmoid()
+            else:
+                # remind that we set FG labels to [0, num_class-1]
+                # since mmdet v2.0
+                # BG cat_id: num_class
+                scores = cls_score.softmax(-1)[:, :-1]
+                degree_score = degree_score.softmax(-1)[:, :-1]
+
+            # After https://github.com/open-mmlab/mmdetection/pull/6268/,
+            # this operation keeps fewer bboxes under the same `nms_pre`.
+            # There is no difference in performance for most models. If you
+            # find a slight drop in performance, you can set a larger
+            # `nms_pre` than before.
+            score_thr = cfg.get('score_thr', 0)
+
+                  
+            # NMS를 위해 회전된 AABB 계산
+            bbox_pred_roatated_aabbs = self._get_rotated_bboxes(bbox_pred, degree_score)
+
+            results = filter_scores_and_topk(
+                scores, score_thr, nms_pre,
+                dict(bbox_pred=bbox_pred_roatated_aabbs, priors=priors))
+            scores, labels, keep_idxs, filtered_results = results
+
+            # bbox_pred = filtered_results['bbox_pred']
+            bbox_pred = bbox_pred[keep_idxs] # 회전되기 전의 bbox로 저장
+            priors = filtered_results['priors']
+            degree_score = degree_score[keep_idxs]
+
+            if with_score_factors:
+                score_factor = score_factor[keep_idxs]
+
+            mlvl_bbox_preds.append(bbox_pred)
+            mlvl_valid_priors.append(priors)
+            mlvl_scores.append(scores)
+            mlvl_labels.append(labels)
+            mlvl_degree_scores.append(degree_score)
+            # degree_score에서 argmax를 통해 실제 각도를 계산하고 추가
+            degree_labels = degree_score.argmax(dim=1) * (360.0 / self.degree_labels_out_channels)
+            mlvl_degree_labels.append(degree_labels)
+
+            if with_score_factors:
+                mlvl_score_factors.append(score_factor)
+
+        bbox_pred = torch.cat(mlvl_bbox_preds)
+        priors = cat_boxes(mlvl_valid_priors)
+        bboxes = self.bbox_coder.decode(priors, bbox_pred, max_shape=img_shape)
+
+        results = InstanceData()
+        results.bboxes = bboxes
+        results.scores = torch.cat(mlvl_scores)
+        results.labels = torch.cat(mlvl_labels)
+        results.degree_scores = torch.cat(mlvl_degree_scores)
+        results.degree_labels = torch.cat(mlvl_degree_labels)
+        if with_score_factors:
+            results.score_factors = torch.cat(mlvl_score_factors)
+
+        return self._bbox_post_process_with_degree(
+            results=results,
+            cfg=cfg,
+            rescale=rescale,
+            with_nms=with_nms,
+            img_meta=img_meta)
+
+    def _get_rotated_bboxes(self, bboxes: Tensor, degree_labels_pred: Tensor) -> Tensor:
+        """회전된 바운딩 박스의 AABB(Axis-Aligned Bounding Box)를 계산합니다.
+        
+        Args:
+            bboxes (Tensor): 바운딩 박스 좌표, shape (n, 4), 형식은 [x1, y1, x2, y2].
+            degree_labels_pred (Tensor): 회전 각도의 예측값, shape (n, num_degree_labels).
+            
+        Returns:
+            Tensor: 회전된 바운딩 박스의 AABB, shape (n, 4), 형식은 [x1, y1, x2, y2].
+        """
+        # 각도 예측값에서 argmax를 통해 실제 각도 계산 (도 단위)
+        angles = degree_labels_pred.argmax(dim=1).float() * (360.0 / self.degree_labels_out_channels)
+        
+        # 바운딩 박스의 중심점 계산
+        centers_x = (bboxes[:, 0] + bboxes[:, 2]) / 2
+        centers_y = (bboxes[:, 1] + bboxes[:, 3]) / 2
+        
+        # 바운딩 박스의 너비와 높이
+        widths = bboxes[:, 2] - bboxes[:, 0]
+        heights = bboxes[:, 3] - bboxes[:, 1]
+        
+        # 각도를 라디안으로 변환
+        angles_rad = angles * (torch.pi / 180.0)
+        
+        # 회전 행렬 계산 (벡터화)
+        cos_angles = torch.cos(angles_rad)
+        sin_angles = torch.sin(angles_rad)
+        
+        # 모든 바운딩 박스의 꼭지점 계산 (벡터화)
+        # 꼭지점 상대 좌표 (중심점 기준)
+        corners_x = torch.stack([
+            -widths/2, widths/2, widths/2, -widths/2
+        ], dim=1)  # shape: (n, 4)
+        
+        corners_y = torch.stack([
+            -heights/2, -heights/2, heights/2, heights/2
+        ], dim=1)  # shape: (n, 4)
+        
+        # 회전 적용 (벡터화)
+        rotated_corners_x = corners_x * cos_angles.unsqueeze(1) - corners_y * sin_angles.unsqueeze(1)
+        rotated_corners_y = corners_x * sin_angles.unsqueeze(1) + corners_y * cos_angles.unsqueeze(1)
+        
+        # 중심점을 더해서 절대 좌표로 변환
+        rotated_corners_x += centers_x.unsqueeze(1)
+        rotated_corners_y += centers_y.unsqueeze(1)
+        
+        # 회전된 꼭지점들의 최소/최대값 계산 (벡터화)
+        min_x = torch.min(rotated_corners_x, dim=1)[0]
+        min_y = torch.min(rotated_corners_y, dim=1)[0]
+        max_x = torch.max(rotated_corners_x, dim=1)[0]
+        max_y = torch.max(rotated_corners_y, dim=1)[0]
+        
+        # 결과 텐서 생성
+        rotated_bboxes = torch.stack([min_x, min_y, max_x, max_y], dim=1)
+        
+        return rotated_bboxes
+    
+    def _bbox_post_process_with_degree(self,
+                           results: InstanceData,
+                           cfg: ConfigDict,
+                           rescale: bool = False,
+                           with_nms: bool = True,
+                           img_meta: Optional[dict] = None) -> InstanceData:
+
+        if rescale:
+            assert img_meta.get('scale_factor') is not None
+            scale_factor = [1 / s for s in img_meta['scale_factor']]
+            results.bboxes = scale_boxes(results.bboxes, scale_factor)
+
+        if hasattr(results, 'score_factors'):
+            # TODO: Add sqrt operation in order to be consistent with
+            #  the paper.
+            score_factors = results.pop('score_factors')
+            results.scores = results.scores * score_factors
+
+        # filter small size bboxes
+        if cfg.get('min_bbox_size', -1) >= 0:
+            w, h = get_box_wh(results.bboxes)
+            valid_mask = (w > cfg.min_bbox_size) & (h > cfg.min_bbox_size)
+            if not valid_mask.all():
+                results = results[valid_mask]
+
+        # TODO: deal with `with_nms` and `nms_cfg=None` in test_cfg
+        if with_nms and results.bboxes.numel() > 0:
+            bboxes = get_box_tensor(results.bboxes)
+            bboxes_rotated_aabb = self._get_rotated_bboxes(bboxes, results.degree_scores)
+
+            det_bboxes, keep_idxs = batched_nms(bboxes_rotated_aabb, results.scores,
+                                                results.labels, cfg.nms)
+            results = results[keep_idxs]
+            # some nms would reweight the score, such as softnms
+
+            # (KHK) 반환되는 det_bboxes는 회전된 상태이므로, 회전 전 bbox 반환을 위해 사용하지 않음
+            # results.scores = det_bboxes[:, -1]
+            results = results[:cfg.max_per_img]
+
+        return results
