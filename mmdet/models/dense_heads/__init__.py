@@ -39,6 +39,7 @@ from .pisa_ssd_head import PISASSDHead
 from .reppoints_head import RepPointsHead
 from .retina_head import RetinaHead
 from .retina_head_with_degree import RetinaHeadWithDegree
+from .retina_head_with_degree_and_sdf import RetinaHeadWithDegreeAndSDF
 from .retina_sepbn_head import RetinaSepBNHead
 from .rpn_head import RPNHead
 from .rtmdet_head import RTMDetHead, RTMDetSepBNHead
@@ -70,5 +71,5 @@ __all__ = [
     'CondInstMaskHead', 'RTMDetInsHead', 'RTMDetInsSepBNHead',
     'BoxInstBboxHead', 'BoxInstMaskHead', 'ConditionalDETRHead', 'DINOHead',
     'ATSSVLFusionHead', 'DABDETRHead', 'DDQDETRHead', 'GroundingDINOHead',
-    'RetinaHeadWithDegree'
+    'RetinaHeadWithDegree', 'RetinaHeadWithDegreeAndSDF'
 ]

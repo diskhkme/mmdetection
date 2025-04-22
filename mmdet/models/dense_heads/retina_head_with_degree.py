@@ -27,7 +27,6 @@ from mmdet.structures.bbox import (cat_boxes, get_box_tensor, get_box_wh,
 from mmcv.ops import batched_nms
 
 
-
 @MODELS.register_module()
 class RetinaHeadWithDegree(RetinaHead):
     def __init__(self, num_degree_labels, num_classes, in_channels, 
@@ -720,6 +719,7 @@ class RetinaHeadWithDegree(RetinaHead):
                            with_nms: bool = True,
                            img_meta: Optional[dict] = None) -> InstanceData:
 
+        # TODO: (KHK) 어떤 경우에 img_meta의 'scale_factor'가 없음
         if rescale:
             assert img_meta.get('scale_factor') is not None
             scale_factor = [1 / s for s in img_meta['scale_factor']]

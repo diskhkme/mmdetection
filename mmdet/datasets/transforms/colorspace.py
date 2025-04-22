@@ -1,14 +1,129 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import math
 from typing import Optional
+import cv2
+from torch import Tensor
 
 import mmcv
 import numpy as np
-from mmcv.transforms import BaseTransform
+from mmcv.transforms import BaseTransform, to_tensor
 from mmcv.transforms.utils import cache_randomness
 
 from mmdet.registry import TRANSFORMS
 from .augment_wrappers import _MAX_LEVEL, level_to_mag
+
+import scipy.ndimage
+import torch
+
+
+def _pad_to_size(tensor, target_img_size):
+    """패딩을 적용하여 텐서를 지정된 크기로 만듭니다."""
+    h, w = tensor.shape[:2]
+    target_h, target_w = target_img_size
+    if h >= target_h and w >= target_w:
+        return tensor
+        
+    # 경계 픽셀 값 추출
+    bottom_edge = tensor[-1, :]  # 하단 경계
+    right_edge = tensor[:, -1]  # 우측 경계
+    
+    pad_h = max(0, target_h - h)
+    pad_w = max(0, target_w - w)
+    
+    # 하단 패딩
+    if pad_h > 0:
+        bottom_pad = bottom_edge.unsqueeze(0).repeat(pad_h, 1)
+        tensor = torch.cat([tensor, bottom_pad], dim=0)
+        
+    # 우측 패딩
+    if pad_w > 0:
+        right_pad = right_edge.unsqueeze(1).repeat(1, pad_w)
+        tensor = torch.cat([tensor, right_pad], dim=1)
+        
+    return tensor
+
+
+def _generate_sdf(input_image_ndarray: np.ndarray, bw_threshold: int = 100) -> Tensor:
+    """이미지에서 SDF(Signed Distance Function)를 생성합니다."""
+    # --- 입력 유효성 검사 ---
+    if not isinstance(input_image_ndarray, np.ndarray):
+        print("Error: Input must be a NumPy ndarray.")
+        return
+    if input_image_ndarray.ndim < 2 or input_image_ndarray.ndim > 3:
+        print(f"Error: Input ndarray has unsupported dimensions: {input_image_ndarray.ndim}")
+        return
+    
+    image = input_image_ndarray # 입력 ndarray를 사용
+    
+    # --- 그레이스케일 변환 ---
+    if image.ndim == 3:
+        # 3차원 배열이면 컬러 이미지로 간주하고 그레이스케일로 변환
+        # OpenCV는 기본적으로 BGR 순서를 가정함
+        try:
+            # 채널 수가 3 또는 4가 아니면 에러 발생 가능성 있음
+            if image.shape[2] == 4: # RGBA 경우, 알파 채널 제외
+                image = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+            elif image.shape[2] == 3: # BGR 또는 RGB
+                # 만약 입력이 RGB 순서라면 cv2.COLOR_RGB2GRAY 사용
+                gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) 
+            else:
+                print(f"Error: Input image has unsupported channel count: {image.shape[2]}")
+                return
+        except cv2.error as e:
+            print(f"Error during grayscale conversion: {e}")
+            return
+            
+    elif image.ndim == 2:
+        # 2차원 배열이면 이미 그레이스케일로 간주
+        gray_image = image
+    else: 
+        # 위에서 이미 ndim 체크했지만, 명확성을 위해 추가
+        print(f"Error: Unexpected image dimensions: {image.ndim}")
+        return
+
+    # --- 1단계: 이진 마스크 생성 ---
+    # 예시: 간단한 임계값 처리 (값이 100보다 어두운 픽셀을 '검은색'으로 간주)
+    threshold_value = bw_threshold
+    binary_mask = gray_image < threshold_value
+
+    # --- 2단계: 거리 변환 및 SDF 계산 ---
+    dist_inside = scipy.ndimage.distance_transform_edt(binary_mask)
+    dist_outside = scipy.ndimage.distance_transform_edt(~binary_mask)
+    sdf = dist_outside - dist_inside
+
+    # 내부는 -1로 truncate하고 외부만 0~1로 정규화
+    sdf_outside = dist_outside.copy()
+    sdf_outside_max = sdf_outside.max()
+    if sdf_outside_max > 0:  # 0으로 나누기 방지
+        sdf_outside = sdf_outside / sdf_outside_max  # 0~1로 정규화
+
+    # 최종 SDF: 내부는 -1, 외부는 0~1
+    normalized_sdf = np.where(binary_mask, -1.0, sdf_outside)
+
+    return to_tensor(normalized_sdf)
+
+
+@TRANSFORMS.register_module()
+class GenerateSDF(BaseTransform):
+    """Generate SDF for the image."""
+    def __init__(self,
+                 bw_threshold: int = 100,
+                 target_img_size: tuple = (800, 800),
+                 pad_to_size: bool = True
+                 ) -> None:
+        self.bw_threshold = bw_threshold
+        self.pad_to_size = pad_to_size
+        self.target_img_size = target_img_size
+
+    def transform(self, results: dict) -> dict:
+        img = results['img']
+        sdf = _generate_sdf(img, self.bw_threshold)
+        
+        if self.pad_to_size and sdf.shape != self.target_img_size:
+            sdf = _pad_to_size(sdf, self.target_img_size)
+            
+        results['sdf'] = sdf
+        return results
 
 
 @TRANSFORMS.register_module()

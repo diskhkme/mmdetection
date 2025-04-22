@@ -148,7 +148,7 @@ class PackDetInputs(BaseTransform):
 
 @TRANSFORMS.register_module()
 class PackDetInputsExtend(PackDetInputs):
-    def __init__(self, meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape', 'scale_factor', 'flip', 'flip_direction')) -> None:
+    def __init__(self, meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape', 'scale_factor', 'flip', 'flip_direction', 'sdf')) -> None:
         super().__init__(meta_keys)
         
 
@@ -161,6 +161,8 @@ class PackDetInputsExtend(PackDetInputs):
             packed_results['data_samples'].gt_instances.degree_labels = to_tensor(results['gt_degree_labels'])
         if 'gt_text_strings' in results:
             packed_results['data_samples'].gt_instances.text_string = results['gt_text_strings']
+        if 'sdf' in results:
+            packed_results['data_samples'].metainfo['sdf'] = to_tensor(results['sdf'])
 
         return packed_results
 
